@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>uCrawler - Googlebot Simulator</title>
+<style>
+  :root {
+    --bg: #1a1a2e;
+    --surface: #16213e;
+    --surface2: #0f3460;
+    --accent: #e94560;
+    --accent2: #0ea5e9;
+    --text: #e0e0e0;
+    --text-dim: #a0a0b0;
+    --border: #2a2a4a;
+    --success: #22c55e;
+    --warn: #f59e0b;
+    --error: #ef4444;
+    --radius: 8px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+  header h1 { font-size: 20px; font-weight: 600; }
+  header h1 span { color: var(--accent); }
+  header .subtitle { color: var(--text-dim); font-size: 13px; }
+
+  .layout {
+    display: grid;
+    grid-template-columns: 320px 1fr;
+    height: calc(100vh - 53px);
+  }
+
+  /* Sidebar */
+  .sidebar {
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+  }
+  .sidebar-section {
+    padding: 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .sidebar-section h3 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-dim);
+    margin-bottom: 10px;
+  }
+
+  /* Form elements */
+  label {
+    display: block;
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+    margin-top: 10px;
+  }
+  label:first-child { margin-top: 0; }
+  input[type="text"], input[type="number"], input[type="url"], select, textarea {
+    width: 100%;
+    padding: 8px 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-size: 13px;
+    outline: none;
+  }
+  input:focus, select:focus, textarea:focus {
+    border-color: var(--accent2);
+  }
+  textarea { resize: vertical; font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace; font-size: 12px; }
+  select { cursor: pointer; }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 16px;
+    border: none;
+    border-radius: var(--radius);
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: opacity 0.15s;
+  }
+  .btn:hover { opacity: 0.85; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-secondary { background: var(--surface2); color: var(--text); }
+  .btn-small { padding: 5px 10px; font-size: 12px; }
+  .btn-block { width: 100%; justify-content: center; }
+
+  .btn-group { display: flex; gap: 8px; margin-top: 12px; }
+
+  /* Config list */
+  .config-item {
+    padding: 8px 12px;
+    border-radius: var(--radius);
+    cursor: pointer;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 13px;
+    margin-bottom: 4px;
+  }
+  .config-item:hover { background: var(--bg); }
+  .config-item.active { background: var(--surface2); border: 1px solid var(--accent2); }
+  .config-item .delete-btn {
+    background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 16px; padding: 0 4px;
+  }
+  .config-item .delete-btn:hover { color: var(--error); }
+
+  /* Main content */
+  .main {
+    overflow-y: auto;
+    padding: 24px;
+  }
+
+  /* Results */
+  .results-panel { margin-top: 20px; }
+  .result-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    margin-bottom: 16px;
+    overflow: hidden;
+  }
+  .result-card-header {
+    padding: 12px 16px;
+    background: var(--surface2);
+    font-size: 13px;
+    font-weight: 600;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    cursor: pointer;
+    user-select: none;
+  }
+  .result-card-header .toggle { color: var(--text-dim); }
+  .result-card-body { padding: 16px; }
+  .result-card-body.collapsed { display: none; }
+
+  .status-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .status-2xx { background: rgba(34,197,94,0.2); color: var(--success); }
+  .status-3xx { background: rgba(245,158,11,0.2); color: var(--warn); }
+  .status-4xx { background: rgba(239,68,68,0.2); color: var(--error); }
+  .status-5xx { background: rgba(239,68,68,0.3); color: #ff6b6b; }
+
+  table.headers-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+  }
+  .headers-table th {
+    text-align: left;
+    padding: 6px 10px;
+    background: var(--bg);
+    color: var(--text-dim);
+    font-weight: 500;
+    border-bottom: 1px solid var(--border);
+  }
+  .headers-table td {
+    padding: 5px 10px;
+    border-bottom: 1px solid var(--border);
+    word-break: break-all;
+  }
+  .headers-table td:first-child { color: var(--accent2); white-space: nowrap; }
+
+  .redirect-chain {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .redirect-step {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    padding: 6px 10px;
+    background: var(--bg);
+    border-radius: var(--radius);
+  }
+  .redirect-arrow { color: var(--warn); font-weight: bold; }
+
+  .error-item {
+    padding: 8px 12px;
+    background: rgba(239,68,68,0.1);
+    border-left: 3px solid var(--error);
+    border-radius: 0 var(--radius) var(--radius) 0;
+    font-size: 13px;
+    margin-bottom: 6px;
+  }
+
+  .console-item {
+    padding: 4px 10px;
+    font-size: 12px;
+    font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace;
+    border-bottom: 1px solid var(--border);
+  }
+  .console-item.error { color: var(--error); }
+  .console-item.warning { color: var(--warn); }
+
+  .info-grid {
+    display: grid;
+    grid-template-columns: 140px 1fr;
+    gap: 6px 12px;
+    font-size: 13px;
+  }
+  .info-grid dt { color: var(--text-dim); }
+  .info-grid dd { word-break: break-all; }
+
+  .spinner {
+    display: inline-block;
+    width: 18px; height: 18px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .crawl-status {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-size: 14px;
+  }
+
+  /* Header editor */
+  .header-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 6px;
+    align-items: center;
+  }
+  .header-row input { flex: 1; }
+  .header-row .remove-header {
+    background: none; border: none; color: var(--text-dim); cursor: pointer; font-size: 18px; padding: 0 4px;
+  }
+  .header-row .remove-header:hover { color: var(--error); }
+
+  /* Trace history */
+  .trace-item {
+    padding: 10px 12px;
+    border-radius: var(--radius);
+    cursor: pointer;
+    font-size: 12px;
+    margin-bottom: 4px;
+    background: var(--bg);
+    border: 1px solid transparent;
+  }
+  .trace-item:hover { border-color: var(--border); }
+  .trace-item .trace-url { font-weight: 500; margin-bottom: 2px; word-break: break-all; }
+  .trace-item .trace-meta { color: var(--text-dim); display: flex; gap: 12px; }
+
+  .tabs { display: flex; border-bottom: 1px solid var(--border); margin-bottom: 16px; }
+  .tab {
+    padding: 10px 20px;
+    cursor: pointer;
+    font-size: 13px;
+    border-bottom: 2px solid transparent;
+    color: var(--text-dim);
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--accent2); border-bottom-color: var(--accent2); }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1><span>u</span>Crawler</h1>
+  <span class="subtitle">Googlebot Simulator</span>
+</header>
+
+<div class="layout">
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="sidebar-section">
+      <h3>Saved Configs</h3>
+      <div id="configList"></div>
+      <button class="btn btn-secondary btn-small btn-block" style="margin-top:8px" onclick="newConfig()">+ New Config</button>
+    </div>
+
+    <div class="sidebar-section" style="flex:1">
+      <h3>Trace History</h3>
+      <div id="traceList"></div>
+    </div>
+  </div>
+
+  <!-- Main -->
+  <div class="main">
+    <div class="tabs">
+      <div class="tab active" data-tab="crawl" onclick="switchTab('crawl')">Crawl</div>
+      <div class="tab" data-tab="results" onclick="switchTab('results')">Results</div>
+    </div>
+
+    <!-- Crawl tab -->
+    <div id="tab-crawl" class="tab-content active">
+      <label>Target URL</label>
+      <input type="url" id="urlInput" placeholder="https://example.com/page">
+
+      <label>Bot / User Agent</label>
+      <select id="uaSelect" onchange="onUAChange()"></select>
+
+      <label>Full User Agent String <span style="font-size:11px;color:var(--text-dim)">(editable)</span></label>
+      <input type="text" id="uaString" placeholder="Custom user agent string">
+
+      <label>
+        Extra Request Headers
+        <button class="btn btn-secondary btn-small" style="float:right;margin-top:-4px" onclick="addHeaderRow()">+ Add</button>
+      </label>
+      <div id="headersEditor"></div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:4px">
+        <div>
+          <label>Viewport Width</label>
+          <input type="number" id="vpWidth" value="1024">
+        </div>
+        <div>
+          <label>Viewport Height</label>
+          <input type="number" id="vpHeight" value="768">
+        </div>
+        <div>
+          <label>Timeout (sec)</label>
+          <input type="number" id="timeout" value="30">
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        <div>
+          <label>Render Wait (sec)</label>
+          <input type="number" id="renderWait" value="5">
+        </div>
+        <div>
+          <label style="visibility:hidden">_</label>
+          <label style="margin:0"><input type="checkbox" id="isMobile"> Mobile emulation</label>
+        </div>
+      </div>
+
+      <div class="btn-group">
+        <button class="btn btn-primary" id="crawlBtn" onclick="startCrawl()">Go to Address</button>
+        <button class="btn btn-secondary" onclick="saveCurrentConfig()">Save Config</button>
+      </div>
+
+      <div id="crawlStatus" style="margin-top:16px"></div>
+    </div>
+
+    <!-- Results tab -->
+    <div id="tab-results" class="tab-content">
+      <div id="resultsPanel">
+        <p style="color:var(--text-dim)">Run a crawl or select a trace from history to see results.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let userAgents = {};
+let currentTrace = null;
+
+// Init
+document.addEventListener('DOMContentLoaded', async () => {
+  await loadUserAgents();
+  await loadConfigs();
+  await loadTraces();
+  addHeaderRow();
+});
+
+async function loadUserAgents() {
+  const res = await fetch('/api/user-agents');
+  userAgents = await res.json();
+  const select = document.getElementById('uaSelect');
+  let categories = {};
+  for (const [name, info] of Object.entries(userAgents)) {
+    if (!categories[info.category]) categories[info.category] = [];
+    categories[info.category].push({ name, ua: info.user_agent });
+  }
+  select.innerHTML = '';
+  for (const [cat, items] of Object.entries(categories)) {
+    const group = document.createElement('optgroup');
+    group.label = cat;
+    for (const item of items) {
+      const opt = document.createElement('option');
+      opt.value = item.ua;
+      opt.textContent = item.name;
+      group.appendChild(opt);
+    }
+    select.appendChild(group);
+  }
+  onUAChange();
+}
+
+function onUAChange() {
+  document.getElementById('uaString').value = document.getElementById('uaSelect').value;
+  // Auto-set mobile + viewport based on selection
+  const name = document.getElementById('uaSelect').selectedOptions[0]?.textContent || '';
+  const isMob = /mobile|smartphone/i.test(name);
+  document.getElementById('isMobile').checked = isMob;
+  if (isMob) {
+    document.getElementById('vpWidth').value = 412;
+    document.getElementById('vpHeight').value = 915;
+  } else {
+    document.getElementById('vpWidth').value = 1024;
+    document.getElementById('vpHeight').value = 768;
+  }
+}
+
+// Headers editor
+function addHeaderRow(key = '', value = '') {
+  const container = document.getElementById('headersEditor');
+  const row = document.createElement('div');
+  row.className = 'header-row';
+  row.innerHTML = `
+    <input type="text" placeholder="Header name" value="${escapeHtml(key)}">
+    <input type="text" placeholder="Value" value="${escapeHtml(value)}">
+    <button class="remove-header" onclick="this.parentElement.remove()">&times;</button>
+  `;
+  container.appendChild(row);
+}
+
+function getExtraHeaders() {
+  const headers = {};
+  document.querySelectorAll('#headersEditor .header-row').forEach(row => {
+    const inputs = row.querySelectorAll('input');
+    const k = inputs[0].value.trim();
+    const v = inputs[1].value.trim();
+    if (k) headers[k] = v;
+  });
+  return headers;
+}
+
+function setExtraHeaders(headers) {
+  const container = document.getElementById('headersEditor');
+  container.innerHTML = '';
+  if (headers && Object.keys(headers).length) {
+    for (const [k, v] of Object.entries(headers)) addHeaderRow(k, v);
+  } else {
+    addHeaderRow();
+  }
+}
+
+// Configs
+async function loadConfigs() {
+  const res = await fetch('/api/configs');
+  const configs = await res.json();
+  const list = document.getElementById('configList');
+  list.innerHTML = '';
+  if (!configs.length) {
+    list.innerHTML = '<div style="font-size:12px;color:var(--text-dim)">No saved configs</div>';
+    return;
+  }
+  for (const cfg of configs) {
+    const item = document.createElement('div');
+    item.className = 'config-item';
+    item.innerHTML = `
+      <span onclick="loadConfig(${escapeHtml(JSON.stringify(JSON.stringify(cfg)))})">${escapeHtml(cfg.name)}</span>
+      <button class="delete-btn" onclick="deleteConfig('${escapeHtml(cfg._filename)}')">&times;</button>
+    `;
+    list.appendChild(item);
+  }
+}
+
+function loadConfig(jsonStr) {
+  const cfg = JSON.parse(jsonStr);
+  document.getElementById('urlInput').value = cfg.url || '';
+  if (cfg.user_agent) {
+    document.getElementById('uaString').value = cfg.user_agent;
+    // Try to match select
+    const sel = document.getElementById('uaSelect');
+    for (const opt of sel.options) {
+      if (opt.value === cfg.user_agent) { sel.value = cfg.user_agent; break; }
+    }
+  }
+  if (cfg.viewport_width) document.getElementById('vpWidth').value = cfg.viewport_width;
+  if (cfg.viewport_height) document.getElementById('vpHeight').value = cfg.viewport_height;
+  if (cfg.timeout_seconds) document.getElementById('timeout').value = cfg.timeout_seconds;
+  if (cfg.render_wait_seconds) document.getElementById('renderWait').value = cfg.render_wait_seconds;
+  document.getElementById('isMobile').checked = !!cfg.is_mobile;
+  setExtraHeaders(cfg.extra_headers || {});
+}
+
+async function saveCurrentConfig() {
+  const name = prompt('Config name:');
+  if (!name) return;
+  const cfg = getCurrentConfig();
+  cfg.name = name;
+  await fetch('/api/configs', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(cfg),
+  });
+  await loadConfigs();
+}
+
+async function deleteConfig(filename) {
+  if (!confirm('Delete this config?')) return;
+  await fetch(`/api/configs/${encodeURIComponent(filename)}`, { method: 'DELETE' });
+  await loadConfigs();
+}
+
+function newConfig() {
+  document.getElementById('urlInput').value = '';
+  document.getElementById('uaSelect').selectedIndex = 0;
+  onUAChange();
+  setExtraHeaders({});
+  document.getElementById('timeout').value = 30;
+  document.getElementById('renderWait').value = 5;
+}
+
+function getCurrentConfig() {
+  return {
+    url: document.getElementById('urlInput').value.trim(),
+    user_agent: document.getElementById('uaString').value.trim(),
+    extra_headers: getExtraHeaders(),
+    viewport_width: parseInt(document.getElementById('vpWidth').value) || 1024,
+    viewport_height: parseInt(document.getElementById('vpHeight').value) || 768,
+    is_mobile: document.getElementById('isMobile').checked,
+    timeout_seconds: parseInt(document.getElementById('timeout').value) || 30,
+    render_wait_seconds: parseInt(document.getElementById('renderWait').value) || 5,
+  };
+}
+
+// Crawl
+async function startCrawl() {
+  const config = getCurrentConfig();
+  if (!config.url) { alert('Enter a URL'); return; }
+  // Ensure URL has protocol
+  if (!/^https?:\/\//i.test(config.url)) config.url = 'https://' + config.url;
+
+  const btn = document.getElementById('crawlBtn');
+  btn.disabled = true;
+  document.getElementById('crawlStatus').innerHTML = '<div class="crawl-status"><div class="spinner"></div>Crawling... this may take a moment</div>';
+
+  try {
+    const res = await fetch('/api/crawl', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config),
+    });
+    const trace = await res.json();
+    if (trace.error) {
+      document.getElementById('crawlStatus').innerHTML = `<div class="crawl-status" style="border-color:var(--error)">Error: ${escapeHtml(trace.error)}</div>`;
+    } else {
+      currentTrace = trace;
+      document.getElementById('crawlStatus').innerHTML = '<div class="crawl-status" style="border-color:var(--success)">Crawl complete! Switching to results...</div>';
+      renderResults(trace);
+      switchTab('results');
+      await loadTraces();
+    }
+  } catch (err) {
+    document.getElementById('crawlStatus').innerHTML = `<div class="crawl-status" style="border-color:var(--error)">Network error: ${escapeHtml(err.message)}</div>`;
+  }
+  btn.disabled = false;
+}
+
+// Traces
+async function loadTraces() {
+  const res = await fetch('/api/traces');
+  const traces = await res.json();
+  const list = document.getElementById('traceList');
+  list.innerHTML = '';
+  if (!traces.length) {
+    list.innerHTML = '<div style="font-size:12px;color:var(--text-dim)">No traces yet</div>';
+    return;
+  }
+  for (const t of traces.slice(0, 50)) {
+    const item = document.createElement('div');
+    item.className = 'trace-item';
+    item.onclick = () => loadTrace(t.filename);
+    const statusClass = t.status ? statusCssClass(t.status) : '';
+    item.innerHTML = `
+      <div class="trace-url">${escapeHtml(t.url)}</div>
+      <div class="trace-meta">
+        <span class="status-badge ${statusClass}">${t.status || '?'}</span>
+        <span>${t.crawled_at ? new Date(t.crawled_at).toLocaleString() : ''}</span>
+        ${t.errors_count ? `<span style="color:var(--error)">${t.errors_count} err</span>` : ''}
+        ${t.redirects_count ? `<span style="color:var(--warn)">${t.redirects_count} redir</span>` : ''}
+      </div>
+    `;
+    list.appendChild(item);
+  }
+}
+
+async function loadTrace(filename) {
+  const res = await fetch(`/api/traces/${encodeURIComponent(filename)}`);
+  const trace = await res.json();
+  currentTrace = trace;
+  renderResults(trace);
+  switchTab('results');
+}
+
+// Render results
+function renderResults(trace) {
+  const panel = document.getElementById('resultsPanel');
+  const meta = trace.meta || {};
+  const statusClass = trace.final_status ? statusCssClass(trace.final_status) : '';
+
+  let html = '';
+
+  // Overview card
+  html += `<div class="result-card">
+    <div class="result-card-header" onclick="toggleCard(this)">
+      Overview <span class="toggle">-</span>
+    </div>
+    <div class="result-card-body">
+      <dl class="info-grid">
+        <dt>Target URL</dt><dd>${escapeHtml(meta.target_url || '')}</dd>
+        <dt>Final URL</dt><dd>${escapeHtml(trace.final_url || '')}</dd>
+        <dt>Status</dt><dd><span class="status-badge ${statusClass}">${trace.final_status || 'N/A'}</span></dd>
+        <dt>Page Title</dt><dd>${escapeHtml(trace.page_title || 'N/A')}</dd>
+        <dt>Meta Robots</dt><dd>${escapeHtml(trace.meta_robots || 'N/A')}</dd>
+        <dt>Canonical</dt><dd>${escapeHtml(trace.canonical_url || 'N/A')}</dd>
+        <dt>User Agent</dt><dd style="font-size:11px">${escapeHtml(meta.user_agent || '')}</dd>
+        <dt>Viewport</dt><dd>${escapeHtml(meta.viewport || '')} ${meta.is_mobile ? '(mobile)' : ''}</dd>
+        <dt>Crawl Started</dt><dd>${meta.crawl_started_at ? new Date(meta.crawl_started_at).toLocaleString() : ''}</dd>
+        <dt>Crawl Finished</dt><dd>${trace.crawl_finished_at ? new Date(trace.crawl_finished_at).toLocaleString() : ''}</dd>
+      </dl>
+    </div>
+  </div>`;
+
+  // Redirect chain
+  if (trace.redirect_chain && trace.redirect_chain.length) {
+    html += `<div class="result-card">
+      <div class="result-card-header" onclick="toggleCard(this)">
+        Redirect Chain (${trace.redirect_chain.length}) <span class="toggle">-</span>
+      </div>
+      <div class="result-card-body">
+        <div class="redirect-chain">`;
+    for (const r of trace.redirect_chain) {
+      const sc = typeof r.status === 'number' ? statusCssClass(r.status) : '';
+      html += `<div class="redirect-step">
+        <span class="status-badge ${sc}">${r.status}</span>
+        <span>${escapeHtml(r.from_url)}</span>
+        <span class="redirect-arrow">&rarr;</span>
+        <span>${escapeHtml(r.to_url)}</span>
+      </div>`;
+    }
+    html += `</div></div></div>`;
+  }
+
+  // Request/Response details
+  if (trace.requests && trace.requests.length) {
+    html += `<div class="result-card">
+      <div class="result-card-header" onclick="toggleCard(this)">
+        Requests &amp; Responses (${trace.requests.length}) <span class="toggle">-</span>
+      </div>
+      <div class="result-card-body">`;
+    for (const req of trace.requests) {
+      const resp = req.response || {};
+      const rsc = resp.status ? statusCssClass(resp.status) : '';
+      html += `<div style="margin-bottom:16px;padding:12px;background:var(--bg);border-radius:var(--radius)">
+        <div style="margin-bottom:8px;font-size:13px;font-weight:600">
+          ${escapeHtml(req.method)} ${escapeHtml(req.url)}
+          ${resp.status ? `<span class="status-badge ${rsc}" style="margin-left:8px">${resp.status} ${escapeHtml(resp.status_text || '')}</span>` : ''}
+        </div>
+        <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px">Type: ${escapeHtml(req.resource_type || '')} | Navigation: ${req.is_navigation}</div>
+        <details style="margin-bottom:6px">
+          <summary style="cursor:pointer;font-size:12px;color:var(--accent2)">Request Headers</summary>
+          ${renderHeadersTable(req.headers || {})}
+        </details>`;
+      if (resp.headers) {
+        html += `<details>
+          <summary style="cursor:pointer;font-size:12px;color:var(--accent2)">Response Headers</summary>
+          ${renderHeadersTable(resp.headers)}
+        </details>`;
+      }
+      html += `</div>`;
+    }
+    html += `</div></div>`;
+  }
+
+  // Errors
+  if (trace.errors && trace.errors.length) {
+    html += `<div class="result-card">
+      <div class="result-card-header" style="border-left:3px solid var(--error)" onclick="toggleCard(this)">
+        Errors (${trace.errors.length}) <span class="toggle">-</span>
+      </div>
+      <div class="result-card-body">`;
+    for (const err of trace.errors) {
+      html += `<div class="error-item">
+        <strong>${escapeHtml(err.type || 'error')}</strong>: ${escapeHtml(err.message || '')}
+        <div style="font-size:11px;color:var(--text-dim)">${err.timestamp || ''}</div>
+      </div>`;
+    }
+    html += `</div></div>`;
+  }
+
+  // Console messages
+  if (trace.console_messages && trace.console_messages.length) {
+    html += `<div class="result-card">
+      <div class="result-card-header" onclick="toggleCard(this)">
+        Console (${trace.console_messages.length}) <span class="toggle">-</span>
+      </div>
+      <div class="result-card-body" style="max-height:300px;overflow-y:auto">`;
+    for (const msg of trace.console_messages) {
+      const cls = msg.type === 'error' ? 'error' : msg.type === 'warning' ? 'warning' : '';
+      html += `<div class="console-item ${cls}">[${escapeHtml(msg.type)}] ${escapeHtml(msg.text)}</div>`;
+    }
+    html += `</div></div>`;
+  }
+
+  // Raw trace file info
+  if (trace._trace_file) {
+    html += `<div style="margin-top:12px;font-size:12px;color:var(--text-dim)">Trace saved to: ${escapeHtml(trace._trace_file)}</div>`;
+  }
+
+  panel.innerHTML = html;
+}
+
+function renderHeadersTable(headers) {
+  let html = '<table class="headers-table"><tr><th>Header</th><th>Value</th></tr>';
+  for (const [k, v] of Object.entries(headers)) {
+    html += `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(v)}</td></tr>`;
+  }
+  html += '</table>';
+  return html;
+}
+
+// UI helpers
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.tab-content').forEach(t => t.classList.toggle('active', t.id === `tab-${name}`));
+}
+
+function toggleCard(header) {
+  const body = header.nextElementSibling;
+  const toggle = header.querySelector('.toggle');
+  body.classList.toggle('collapsed');
+  toggle.textContent = body.classList.contains('collapsed') ? '+' : '-';
+}
+
+function statusCssClass(status) {
+  if (status >= 200 && status < 300) return 'status-2xx';
+  if (status >= 300 && status < 400) return 'status-3xx';
+  if (status >= 400 && status < 500) return 'status-4xx';
+  if (status >= 500) return 'status-5xx';
+  return '';
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+</script>
+
+</body>
+</html>
