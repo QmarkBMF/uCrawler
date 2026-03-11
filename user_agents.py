@@ -84,22 +84,56 @@ USER_AGENTS = {
         "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 14_7_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Mobile/15E148 Safari/604.1 (Applebot/0.1; +http://www.apple.com/go/applebot)",
         "category": "Apple",
     },
+    "Applebot-Extended (AI training)": {
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.1.1 Safari/605.1.15 (Applebot-Extended/0.1; +http://www.apple.com/go/applebot)",
+        "category": "Apple",
+    },
 
-    # AI Crawlers
-    "GPTBot (OpenAI)": {
+    # Google AI
+    "Google-Extended (Gemini training)": {
+        "user_agent": "Mozilla/5.0 (compatible; Google-Extended; +https://developers.google.com/search/docs/crawling-indexing/google-common-crawlers)",
+        "category": "Google",
+    },
+
+    # AI Crawlers - OpenAI
+    "GPTBot (OpenAI - training)": {
         "user_agent": "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.2; +https://openai.com/gptbot)",
         "category": "AI Crawlers",
     },
-    "ChatGPT-User": {
+    "OAI-SearchBot (ChatGPT Search)": {
+        "user_agent": "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; OAI-SearchBot/1.0; +https://openai.com/searchbot)",
+        "category": "AI Crawlers",
+    },
+    "ChatGPT-User (browsing)": {
         "user_agent": "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ChatGPT-User/1.0; +https://openai.com/bot)",
         "category": "AI Crawlers",
     },
-    "ClaudeBot (Anthropic)": {
+
+    # AI Crawlers - Anthropic
+    "ClaudeBot (Anthropic - training)": {
         "user_agent": "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +https://www.anthropic.com/crawling-agent)",
         "category": "AI Crawlers",
     },
-    "PerplexityBot": {
+
+    # AI Crawlers - Perplexity
+    "PerplexityBot (indexing)": {
         "user_agent": "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; PerplexityBot/1.0; +https://docs.perplexity.ai/docs/perplexity-bot)",
+        "category": "AI Crawlers",
+    },
+
+    # AI Crawlers - Meta
+    "Meta-ExternalAgent": {
+        "user_agent": "Mozilla/5.0 (compatible; Meta-ExternalAgent/1.0; +https://developers.facebook.com/docs/sharing/webmasters/crawler)",
+        "category": "AI Crawlers",
+    },
+
+    # AI Crawlers - Other
+    "Amazonbot": {
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_1) AppleWebKit/600.2.5 (KHTML, like Gecko) Version/8.0.2 Safari/600.2.5 (Amazonbot/0.1; +https://developer.amazon.com/support/amazonbot)",
+        "category": "AI Crawlers",
+    },
+    "Bytespider (ByteDance/TikTok)": {
+        "user_agent": "Mozilla/5.0 (Linux; Android 5.0) AppleWebKit/537.36 (KHTML, like Gecko) Mobile Safari/537.36 (compatible; Bytespider; spider-feedback@bytedance.com)",
         "category": "AI Crawlers",
     },
 

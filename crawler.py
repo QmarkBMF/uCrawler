@@ -16,15 +16,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from playwright.sync_api import sync_playwright, Page, BrowserContext, Route
 
-# Default headers that Googlebot typically sends
+# Default headers that Googlebot typically sends.
+# Based on research: Googlebot sends Accept: */*, does NOT send Accept-Language
+# by default (only when server returns Vary: Accept-Language), uses From header,
+# and supports gzip, deflate, and Brotli compression.
 GOOGLEBOT_DEFAULT_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "*/*",
     "Accept-Encoding": "gzip, deflate, br",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
     "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
+    "From": "googlebot(at)googlebot.com",
 }
 
 
