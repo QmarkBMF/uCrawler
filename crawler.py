@@ -85,7 +85,11 @@ def run_crawl(url: str, user_agent: str, extra_headers: dict | None = None,
         "canonical_url": None,
         "crawl_finished_at": None,
         "network_summary": None,
+        "ssr_detection": None,
     }
+
+    # Will hold the raw HTML body from the initial document response (before JS)
+    initial_html_holder = {}
 
     # Map request objects by internal Playwright URL for correlation
     # Use list to handle multiple requests to same URL
@@ -200,6 +204,17 @@ def run_crawl(url: str, user_agent: str, extra_headers: dict | None = None,
                 "elapsed_ms": elapsed,
                 "latency_ms": elapsed - req_entry["elapsed_ms"],
             }
+
+            # Capture initial HTML for SSR detection (first successful document response)
+            if (req_entry.get("is_navigation") and 200 <= response.status < 300
+                    and "html" in content_type
+                    and "initial_html" not in initial_html_holder):
+                try:
+                    body = response.text()
+                    initial_html_holder["initial_html"] = body
+                    initial_html_holder["response_headers"] = resp_headers
+                except Exception:
+                    pass
 
             # Track redirect chain for navigation requests
             status = response.status
@@ -325,6 +340,15 @@ def run_crawl(url: str, user_agent: str, extra_headers: dict | None = None,
 
             trace["final_url"] = page.url
 
+            # --- SSR Detection ---
+            # Compare initial server HTML against post-JS rendered DOM
+            try:
+                trace["ssr_detection"] = _detect_ssr(
+                    page, initial_html_holder, trace["requests"]
+                )
+            except Exception as e:
+                trace["ssr_detection"] = {"error": str(e)}
+
         except Exception as e:
             trace["errors"].append({
                 "type": "navigation_error",
@@ -341,6 +365,216 @@ def run_crawl(url: str, user_agent: str, extra_headers: dict | None = None,
     trace["network_summary"] = _build_network_summary(trace)
 
     return trace
+
+
+def _detect_ssr(page, initial_html_holder: dict, requests: list) -> dict:
+    """
+    Analyze whether the server delivered SSR content and how Google might detect it.
+
+    Compares the raw HTML from the server response (before JS execution) against
+    the final rendered DOM (after JS). Looks for SSR framework markers, inline data,
+    and content differences that reveal server-side rendering.
+    """
+    result = {
+        "is_ssr_detected": False,
+        "confidence": "none",
+        "signals": [],
+        "initial_html_length": None,
+        "rendered_html_length": None,
+        "content_present_before_js": False,
+        "hydration_markers": [],
+        "ssr_framework": None,
+        "inline_data_scripts": [],
+        "response_headers_hints": [],
+    }
+
+    initial_html = initial_html_holder.get("initial_html", "")
+    resp_headers = initial_html_holder.get("response_headers", {})
+
+    if not initial_html:
+        result["signals"].append("no initial HTML captured (may have been a redirect or error)")
+        return result
+
+    result["initial_html_length"] = len(initial_html)
+
+    # Get the rendered HTML after JS execution
+    rendered_html = page.content()
+    result["rendered_html_length"] = len(rendered_html)
+
+    initial_lower = initial_html.lower()
+
+    # --- 1. Check response headers for SSR hints ---
+    ssr_header_patterns = {
+        "x-powered-by": "server framework",
+        "x-ssr": "explicit SSR header",
+        "x-rendered-by": "explicit render header",
+        "x-nextjs-page": "Next.js page header",
+        "x-nextjs-cache": "Next.js cache header",
+        "x-middleware-rewrite": "Next.js middleware rewrite",
+        "x-nuxt": "Nuxt.js header",
+        "x-gatsby-cache": "Gatsby cache header",
+    }
+    for header, desc in ssr_header_patterns.items():
+        val = resp_headers.get(header)
+        if val:
+            result["response_headers_hints"].append({
+                "header": header,
+                "value": val,
+                "meaning": desc,
+            })
+            result["signals"].append(f"Response header '{header}: {val}' indicates {desc}")
+
+    # --- 2. Check for hydration/framework markers in initial HTML ---
+    hydration_checks = [
+        ("data-reactroot", "React SSR (data-reactroot)"),
+        ("data-react-helmet", "React Helmet SSR (meta tags)"),
+        ("data-server-rendered", "Vue SSR (data-server-rendered)"),
+        ("data-v-", "Vue SSR (scoped style attributes)"),
+        ("__next_data__", "Next.js SSR (__NEXT_DATA__ script)"),
+        ("__next_f", "Next.js RSC (React Server Components)"),
+        ("__nuxt__", "Nuxt.js SSR (__NUXT__ data)"),
+        ("__nuxt_data__", "Nuxt 3 SSR payload"),
+        ("__gatsby", "Gatsby SSR"),
+        ("data-styled", "styled-components SSR"),
+        ("_ssgmanifest", "Next.js SSG manifest"),
+        ("__remix_context__", "Remix SSR"),
+        ("__astro", "Astro SSR"),
+        ("data-svelte", "SvelteKit SSR"),
+        ("<!--$-->", "React Suspense SSR boundary"),
+        ("<!--/$-->", "React Suspense SSR boundary end"),
+        ("data-rsc", "React Server Components"),
+    ]
+    for marker, desc in hydration_checks:
+        if marker.lower() in initial_lower:
+            result["hydration_markers"].append({"marker": marker, "framework": desc})
+            result["signals"].append(f"Found hydration marker '{marker}' -> {desc}")
+
+    # Determine SSR framework from markers
+    framework_map = {
+        "__next_data__": "Next.js",
+        "__next_f": "Next.js (RSC)",
+        "__nuxt__": "Nuxt.js",
+        "__nuxt_data__": "Nuxt 3",
+        "__gatsby": "Gatsby",
+        "__remix_context__": "Remix",
+        "__astro": "Astro",
+        "data-svelte": "SvelteKit",
+    }
+    for marker, framework in framework_map.items():
+        if marker.lower() in initial_lower:
+            result["ssr_framework"] = framework
+            break
+
+    # --- 3. Check for inline data scripts (SSR data injection) ---
+    # These are <script> tags that embed JSON data for hydration
+    import re
+    inline_data_patterns = [
+        (r'<script\s+id="__NEXT_DATA__"[^>]*>(.*?)</script>', "Next.js page data"),
+        (r'<script>window\.__NUXT__\s*=\s*', "Nuxt.js hydration data"),
+        (r'<script>window\.__INITIAL_STATE__\s*=\s*', "Vuex/Redux initial state"),
+        (r'<script>window\.__PRELOADED_STATE__\s*=\s*', "Redux preloaded state"),
+        (r'<script>window\.__APOLLO_STATE__\s*=\s*', "Apollo GraphQL SSR cache"),
+        (r'<script>window\.__RELAY_STORE__\s*=\s*', "Relay SSR store"),
+        (r'<script[^>]*>.*?"features".*?</script>', "Inline features/config data"),
+    ]
+    for pattern, desc in inline_data_patterns:
+        matches = re.findall(pattern, initial_html, re.DOTALL | re.IGNORECASE)
+        if matches:
+            # Truncate match content for trace readability
+            preview = matches[0][:500] if matches[0] else ""
+            result["inline_data_scripts"].append({
+                "type": desc,
+                "count": len(matches),
+                "preview": preview,
+            })
+            result["signals"].append(f"Found inline data script: {desc} ({len(matches)} occurrence(s))")
+
+    # --- 4. Check if meaningful content exists before JS ---
+    # If the initial HTML has real text content in the body, it's SSR
+    content_check = page.evaluate("""(initialHtml) => {
+        // Parse the initial HTML to extract text content
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(initialHtml, 'text/html');
+        const body = doc.body;
+        if (!body) return { textLength: 0, hasContent: false };
+
+        // Remove script and style tags
+        body.querySelectorAll('script, style, noscript').forEach(el => el.remove());
+        const text = body.textContent.trim();
+
+        // Check for common empty SPA shells
+        const isEmptyShell = body.innerHTML.trim() === '' ||
+            body.innerHTML.trim() === '<div id="root"></div>' ||
+            body.innerHTML.trim() === '<div id="app"></div>' ||
+            body.innerHTML.trim() === '<div id="__next"></div>';
+
+        // Count meaningful DOM elements in initial HTML
+        const meaningfulElements = body.querySelectorAll(
+            'p, h1, h2, h3, h4, h5, h6, li, td, th, article, section, main, span, a, img'
+        ).length;
+
+        return {
+            textLength: text.length,
+            text: text.substring(0, 1000),
+            hasContent: text.length > 100,
+            isEmptyShell: isEmptyShell,
+            meaningfulElements: meaningfulElements,
+        };
+    }""", initial_html)
+    result["content_present_before_js"] = content_check.get("hasContent", False)
+    result["initial_content"] = content_check
+
+    # --- 5. Check for XHR/fetch to feature/config endpoints from server vs client ---
+    # If /web/1/features is NOT in the network log but data is present in initial HTML,
+    # it means the server fetched it during SSR (invisible to browser)
+    feature_in_network = False
+    feature_urls = []
+    for r in requests:
+        req_url = r.get("url", "")
+        if any(p in req_url for p in ["/web/1/features", "/api/features", "/features",
+                                       "/_next/data", "/__data"]):
+            feature_in_network = True
+            feature_urls.append({
+                "url": req_url,
+                "resource_type": r.get("resource_type"),
+                "order": r.get("order"),
+                "elapsed_ms": r.get("elapsed_ms"),
+                "status": r.get("response", {}).get("status") if r.get("response") else None,
+            })
+
+    result["feature_endpoint_requests"] = feature_urls
+    if not feature_in_network and result["content_present_before_js"]:
+        result["signals"].append(
+            "Content present in initial HTML but no /features endpoint called from browser "
+            "-> server likely fetched it during SSR (invisible to client)"
+        )
+
+    # --- 6. Determine overall SSR confidence ---
+    signal_count = len(result["signals"])
+    has_hydration = len(result["hydration_markers"]) > 0
+    has_content = result["content_present_before_js"]
+    has_inline_data = len(result["inline_data_scripts"]) > 0
+    has_ssr_headers = len(result["response_headers_hints"]) > 0
+
+    if has_hydration and has_content:
+        result["is_ssr_detected"] = True
+        result["confidence"] = "high"
+    elif has_content and (has_inline_data or has_ssr_headers):
+        result["is_ssr_detected"] = True
+        result["confidence"] = "high"
+    elif has_hydration or has_inline_data:
+        result["is_ssr_detected"] = True
+        result["confidence"] = "medium"
+    elif has_content and not content_check.get("isEmptyShell"):
+        result["is_ssr_detected"] = True
+        result["confidence"] = "medium"
+    elif has_ssr_headers:
+        result["is_ssr_detected"] = True
+        result["confidence"] = "low"
+    elif signal_count > 0:
+        result["confidence"] = "low"
+
+    return result
 
 
 def _build_network_summary(trace: dict) -> dict:
