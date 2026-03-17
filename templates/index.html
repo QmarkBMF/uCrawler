@@ -482,16 +482,24 @@ async function loadConfigs() {
   for (const cfg of configs) {
     const item = document.createElement('div');
     item.className = 'config-item';
-    item.innerHTML = `
-      <span onclick="loadConfig(${escapeHtml(JSON.stringify(JSON.stringify(cfg)))})">${escapeHtml(cfg.name)}</span>
-      <button class="delete-btn" onclick="deleteConfig('${escapeHtml(cfg._filename)}')">&times;</button>
-    `;
+
+    const nameSpan = document.createElement('span');
+    nameSpan.textContent = cfg.name;
+    nameSpan.addEventListener('click', () => loadConfig(cfg));
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'delete-btn';
+    delBtn.textContent = '\u00d7';
+    delBtn.addEventListener('click', () => deleteConfig(cfg._filename));
+
+    item.appendChild(nameSpan);
+    item.appendChild(delBtn);
     list.appendChild(item);
   }
 }
 
-function loadConfig(jsonStr) {
-  const cfg = JSON.parse(jsonStr);
+function loadConfig(cfgOrJson) {
+  const cfg = typeof cfgOrJson === 'string' ? JSON.parse(cfgOrJson) : cfgOrJson;
   document.getElementById('urlInput').value = cfg.url || '';
   if (cfg.user_agent) {
     document.getElementById('uaString').value = cfg.user_agent;
