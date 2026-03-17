@@ -13,6 +13,7 @@ Key Googlebot behaviors simulated:
 """
 
 import json
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -367,6 +368,278 @@ def run_crawl(url: str, user_agent: str, extra_headers: dict | None = None,
     return trace
 
 
+def _detect_react_suspense(initial_html: str, rendered_html: str, page) -> dict:
+    """
+    Deep detection of React Suspense SSR patterns.
+
+    React 18+ uses Suspense for streaming SSR. The server sends HTML with
+    special comment boundaries (<!--$-->, <!--/$-->) wrapping each Suspense
+    region. When a Suspense boundary is still loading, the server sends
+    fallback content first, then streams the real content in a <script> tag
+    that performs a DOM swap via $RC (completeBoundary).
+
+    This is how Google can detect SSR: the initial HTML contains these
+    React-internal comment markers and inline scripts that no client-side
+    app would produce.
+    """
+    result = {
+        "detected": False,
+        "summary": "",
+        "boundaries": {
+            "completed": 0,
+            "pending": 0,
+            "errored": 0,
+            "total": 0,
+        },
+        "streaming_scripts": [],
+        "fallback_content": [],
+        "hydration_ids": [],
+        "selective_hydration": False,
+        "server_components": False,
+        "signals": [],
+    }
+
+    if not initial_html:
+        return result
+
+    # --- 1. Suspense boundary comment markers ---
+    # React SSR wraps each Suspense region with comment nodes:
+    #   <!--$-->   = completed boundary (content resolved on server)
+    #   <!--$?-->  = pending boundary (fallback content, waiting for stream)
+    #   <!--$!-->  = errored boundary (error fallback shown)
+    #   <!--/$-->  = boundary end
+    completed_boundaries = re.findall(r'<!--\$-->', initial_html)
+    pending_boundaries = re.findall(r'<!--\$\?-->', initial_html)
+    errored_boundaries = re.findall(r'<!--\$!-->', initial_html)
+    boundary_ends = re.findall(r'<!--/\$-->', initial_html)
+
+    result["boundaries"]["completed"] = len(completed_boundaries)
+    result["boundaries"]["pending"] = len(pending_boundaries)
+    result["boundaries"]["errored"] = len(errored_boundaries)
+    result["boundaries"]["total"] = (
+        len(completed_boundaries) + len(pending_boundaries) + len(errored_boundaries)
+    )
+
+    if result["boundaries"]["total"] > 0:
+        result["detected"] = True
+        parts = []
+        if completed_boundaries:
+            parts.append(f"{len(completed_boundaries)} completed")
+        if pending_boundaries:
+            parts.append(f"{len(pending_boundaries)} pending/streaming")
+        if errored_boundaries:
+            parts.append(f"{len(errored_boundaries)} errored")
+        result["signals"].append(
+            f"Found {result['boundaries']['total']} Suspense boundaries: "
+            + ", ".join(parts)
+        )
+
+    # --- 2. Streaming completion scripts ($RC / completeBoundary) ---
+    # When a pending Suspense boundary resolves during streaming, React injects:
+    #   <script>$RC("B:0","S:0")</script>   - completeBoundary
+    #   <script>$RC("B:0","S:0",E)</script> - completeBoundaryWithStyles
+    # $RC replaces the fallback <template> content with the resolved content.
+    rc_calls = re.findall(
+        r'<script>\s*\$R([CS])\s*\(\s*"([^"]+)"\s*,\s*"([^"]+)"[^)]*\)\s*</script>',
+        initial_html
+    )
+    if rc_calls:
+        result["detected"] = True
+        for func_type, boundary_id, segment_id in rc_calls:
+            func_name = "$RC" if func_type == "C" else "$RS"
+            result["streaming_scripts"].append({
+                "function": func_name,
+                "boundary_id": boundary_id,
+                "segment_id": segment_id,
+            })
+        result["signals"].append(
+            f"Found {len(rc_calls)} streaming completion scripts "
+            f"($RC/$RS calls replacing fallback content)"
+        )
+
+    # --- 3. Hidden template segments for streaming ---
+    # Pending boundaries have their resolved content delivered in hidden templates:
+    #   <template id="S:0">...resolved content...</template>
+    # These exist in the HTML but are invisible until $RC swaps them in.
+    template_segments = re.findall(
+        r'<template\s+id="(S:\d+)"[^>]*>(.*?)</template>',
+        initial_html, re.DOTALL
+    )
+    if template_segments:
+        result["detected"] = True
+        for seg_id, content in template_segments:
+            result["signals"].append(
+                f"Hidden <template id=\"{seg_id}\"> found "
+                f"({len(content)} chars of streamed content)"
+            )
+
+    # --- 4. Suspense fallback detection ---
+    # Pending boundaries wrap a <template> (slot marker) + fallback content:
+    #   <!--$?--><template id="B:0"></template><div>Loading...</div><!--/$-->
+    fallback_pattern = re.findall(
+        r'<!--\$\?-->\s*<template\s+id="(B:\d+)"[^>]*></template>(.*?)<!--/\$-->',
+        initial_html, re.DOTALL
+    )
+    if fallback_pattern:
+        result["detected"] = True
+        for boundary_id, fallback_html in fallback_pattern:
+            # Extract visible text from fallback
+            fallback_text = re.sub(r'<[^>]+>', '', fallback_html).strip()
+            result["fallback_content"].append({
+                "boundary_id": boundary_id,
+                "fallback_html": fallback_html[:500],
+                "fallback_text": fallback_text[:200],
+            })
+        result["signals"].append(
+            f"Found {len(fallback_pattern)} pending Suspense fallbacks "
+            f"(server still streaming these regions)"
+        )
+
+    # --- 5. React hydration ID attributes ---
+    # React SSR adds internal IDs for hydration reconciliation.
+    # In React 18 streaming SSR, elements get data-reactid or internal fiber IDs.
+    hydration_ids = set()
+    for match in re.finditer(r'data-reactid="([^"]+)"', initial_html):
+        hydration_ids.add(match.group(1))
+    # React 18+ uses shorter integer IDs in comments
+    for match in re.finditer(r'<!--\$(\d+)-->', initial_html):
+        hydration_ids.add(match.group(1))
+    if hydration_ids:
+        result["hydration_ids"] = sorted(hydration_ids)[:50]  # cap at 50
+        result["signals"].append(
+            f"Found {len(hydration_ids)} React hydration IDs in server HTML"
+        )
+
+    # --- 6. Selective hydration detection ---
+    # React 18 can selectively hydrate Suspense boundaries on interaction.
+    # This is detectable by checking if Suspense boundaries in the initial HTML
+    # get replaced with different content after JS hydrates the page.
+    if result["boundaries"]["total"] > 0 and rendered_html:
+        rendered_completed = len(re.findall(r'<!--\$-->', rendered_html))
+        rendered_pending = len(re.findall(r'<!--\$\?-->', rendered_html))
+        # After hydration, pending boundaries should resolve (fewer <!--$?-->)
+        if pending_boundaries and rendered_pending < len(pending_boundaries):
+            result["selective_hydration"] = True
+            result["signals"].append(
+                f"Selective hydration detected: {len(pending_boundaries)} pending "
+                f"boundaries before JS -> {rendered_pending} after hydration"
+            )
+
+    # --- 7. React Server Components (RSC) payload detection ---
+    # RSC sends a special binary/text stream format, often in script tags or
+    # as a separate flight response. The payload lines start with hex IDs.
+    # Format: 0:["$","div",null,{"children":...}]
+    rsc_payload = re.findall(
+        r'<script>self\.__next_f\.push\(\[(\d+),\s*"(.*?)"\]\)</script>',
+        initial_html, re.DOTALL
+    )
+    if rsc_payload:
+        result["detected"] = True
+        result["server_components"] = True
+        result["signals"].append(
+            f"React Server Components flight payload detected: "
+            f"{len(rsc_payload)} RSC chunks in inline scripts"
+        )
+
+    # Also check for RSC wire format in raw form (non-Next.js)
+    rsc_wire = re.findall(r'^[0-9a-f]+:[\["{]', initial_html, re.MULTILINE)
+    if rsc_wire and not rsc_payload:
+        result["detected"] = True
+        result["server_components"] = True
+        result["signals"].append(
+            f"RSC wire format detected: {len(rsc_wire)} RSC data lines"
+        )
+
+    # --- 8. React SSR runtime bootstrap scripts ---
+    # React streaming SSR injects inline scripts that define $RC, $RM, etc.
+    # These are fingerprints of React's server rendering runtime.
+    runtime_funcs = {
+        "$RC": "completeBoundary (swap streamed content into pending boundary)",
+        "$RS": "completeSegment (append streamed segment)",
+        "$RX": "completeBoundaryWithError (show error fallback)",
+        "$RM": "removeTemplate (clean up streaming template)",
+    }
+    found_runtime = []
+    for func, desc in runtime_funcs.items():
+        # Match function definition patterns
+        escaped = re.escape(func)
+        if re.search(rf'function\s+{escaped}\s*\(|{escaped}\s*=\s*function', initial_html):
+            found_runtime.append({"function": func, "purpose": desc})
+
+    if found_runtime:
+        result["detected"] = True
+        result["signals"].append(
+            f"React SSR runtime functions defined in HTML: "
+            + ", ".join(f["function"] for f in found_runtime)
+        )
+
+    # --- 9. Compare Suspense regions: initial vs rendered ---
+    # Use the browser to compare what was inside each Suspense boundary
+    # before and after JS hydration
+    if result["boundaries"]["total"] > 0:
+        try:
+            suspense_diff = page.evaluate("""(initialHtml) => {
+                const parser = new DOMParser();
+                const initialDoc = parser.parseFromString(initialHtml, 'text/html');
+
+                // Walk through comment nodes to find Suspense boundaries
+                const walker = document.createTreeWalker(
+                    document.body, NodeFilter.SHOW_COMMENT
+                );
+                const renderedBoundaries = [];
+                let node;
+                while (node = walker.nextNode()) {
+                    if (node.data === '$' || node.data === '$?' || node.data === '$!') {
+                        // Collect siblings until /$
+                        let content = [];
+                        let sibling = node.nextSibling;
+                        while (sibling) {
+                            if (sibling.nodeType === 8 && sibling.data === '/$') break;
+                            if (sibling.nodeType === 1) {
+                                content.push(sibling.outerHTML.substring(0, 300));
+                            } else if (sibling.nodeType === 3 && sibling.textContent.trim()) {
+                                content.push(sibling.textContent.trim().substring(0, 200));
+                            }
+                            sibling = sibling.nextSibling;
+                        }
+                        renderedBoundaries.push({
+                            type: node.data === '$' ? 'completed' :
+                                  node.data === '$?' ? 'pending' : 'errored',
+                            contentPreview: content.join('\\n').substring(0, 500),
+                        });
+                    }
+                }
+                return {
+                    renderedBoundaryCount: renderedBoundaries.length,
+                    boundaries: renderedBoundaries.slice(0, 20),
+                };
+            }""", initial_html)
+            if suspense_diff.get("renderedBoundaryCount", 0) > 0:
+                result["signals"].append(
+                    f"{suspense_diff['renderedBoundaryCount']} Suspense boundary "
+                    f"regions found in rendered DOM"
+                )
+        except Exception:
+            pass
+
+    # --- Build summary ---
+    if result["detected"]:
+        parts = []
+        if result["boundaries"]["total"] > 0:
+            parts.append(f"{result['boundaries']['total']} boundaries")
+        if result["server_components"]:
+            parts.append("RSC payload")
+        if result["streaming_scripts"]:
+            parts.append(f"{len(result['streaming_scripts'])} streaming swaps")
+        if result["fallback_content"]:
+            parts.append(f"{len(result['fallback_content'])} fallbacks")
+        if result["selective_hydration"]:
+            parts.append("selective hydration")
+        result["summary"] = ", ".join(parts) if parts else "Suspense markers found"
+
+    return result
+
+
 def _detect_ssr(page, initial_html_holder: dict, requests: list) -> dict:
     """
     Analyze whether the server delivered SSR content and how Google might detect it.
@@ -386,6 +659,7 @@ def _detect_ssr(page, initial_html_holder: dict, requests: list) -> dict:
         "ssr_framework": None,
         "inline_data_scripts": [],
         "response_headers_hints": [],
+        "suspense": None,
     }
 
     initial_html = initial_html_holder.get("initial_html", "")
@@ -467,7 +741,6 @@ def _detect_ssr(page, initial_html_holder: dict, requests: list) -> dict:
 
     # --- 3. Check for inline data scripts (SSR data injection) ---
     # These are <script> tags that embed JSON data for hydration
-    import re
     inline_data_patterns = [
         (r'<script\s+id="__NEXT_DATA__"[^>]*>(.*?)</script>', "Next.js page data"),
         (r'<script>window\.__NUXT__\s*=\s*', "Nuxt.js hydration data"),
@@ -549,14 +822,28 @@ def _detect_ssr(page, initial_html_holder: dict, requests: list) -> dict:
             "-> server likely fetched it during SSR (invisible to client)"
         )
 
-    # --- 6. Determine overall SSR confidence ---
+    # --- 6. React Suspense deep detection ---
+    suspense_result = _detect_react_suspense(initial_html, rendered_html, page)
+    result["suspense"] = suspense_result
+    if suspense_result["detected"]:
+        result["signals"].append(
+            f"React Suspense SSR detected: {suspense_result['summary']}"
+        )
+        if not result["ssr_framework"]:
+            result["ssr_framework"] = "React (Suspense SSR)"
+
+    # --- 7. Determine overall SSR confidence ---
     signal_count = len(result["signals"])
     has_hydration = len(result["hydration_markers"]) > 0
     has_content = result["content_present_before_js"]
     has_inline_data = len(result["inline_data_scripts"]) > 0
     has_ssr_headers = len(result["response_headers_hints"]) > 0
+    has_suspense = suspense_result["detected"]
 
-    if has_hydration and has_content:
+    if has_suspense:
+        result["is_ssr_detected"] = True
+        result["confidence"] = "high"
+    elif has_hydration and has_content:
         result["is_ssr_detected"] = True
         result["confidence"] = "high"
     elif has_content and (has_inline_data or has_ssr_headers):
