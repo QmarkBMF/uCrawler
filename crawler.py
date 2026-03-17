@@ -221,12 +221,39 @@ def run_crawl(url: str, user_agent: str, extra_headers: dict | None = None,
             status = response.status
             if 300 <= status < 400 and req_entry.get("is_navigation"):
                 location = resp_headers.get("location", "")
+                # Capture HTML body of the redirect page — many redirect pages
+                # contain HTML with meta tags, JS redirects, or cloaked content
+                # that Google can see and analyze.
+                redirect_body = None
+                try:
+                    redirect_body = response.text()
+                except Exception:
+                    pass
                 trace["redirect_chain"].append({
                     "from_url": response.url,
                     "to_url": location,
                     "status": status,
                     "headers": resp_headers,
+                    "body": redirect_body,
                 })
+
+            # Also capture bodies for non-navigation HTML responses that are
+            # soft redirects (200 status but page contains redirect logic)
+            if (req_entry.get("is_navigation") and 200 <= status < 300
+                    and "html" in content_type):
+                try:
+                    body = response.text()
+                    # Check if this 200 page is actually a soft redirect
+                    if _looks_like_redirect_page(body):
+                        trace["redirect_chain"].append({
+                            "from_url": response.url,
+                            "to_url": "(detected in body)",
+                            "status": "soft-redirect",
+                            "headers": resp_headers,
+                            "body": body,
+                        })
+                except Exception:
+                    pass
 
         def on_request_failed(request):
             now = datetime.now(timezone.utc).isoformat()
@@ -362,10 +389,328 @@ def run_crawl(url: str, user_agent: str, extra_headers: dict | None = None,
 
     trace["crawl_finished_at"] = datetime.now(timezone.utc).isoformat()
 
+    # Analyze HTML content of all redirect pages
+    trace["redirect_analysis"] = _analyze_redirect_chain(trace["redirect_chain"])
+
     # Build network summary for quick analysis
     trace["network_summary"] = _build_network_summary(trace)
 
     return trace
+
+
+def _looks_like_redirect_page(html: str) -> bool:
+    """
+    Detect if a 200-status HTML page is actually a soft redirect.
+
+    Many sites return 200 but redirect via meta refresh, JS location change,
+    or framework router redirects. Google sees and indexes these differently.
+    """
+    if not html or len(html) > 500_000:  # skip huge pages
+        return False
+    lower = html.lower()
+
+    # Meta refresh
+    if re.search(r'<meta\s+http-equiv=["\']?refresh["\']?', lower):
+        return True
+
+    # JS redirects
+    js_redirect_patterns = [
+        r'window\.location\s*[=.]',
+        r'location\.href\s*=',
+        r'location\.replace\s*\(',
+        r'location\.assign\s*\(',
+        r'document\.location\s*=',
+        r'window\.navigate\s*\(',
+        r'router\.push\s*\(',
+        r'router\.replace\s*\(',
+        r'history\.pushState\s*\(',
+        r'history\.replaceState\s*\(',
+    ]
+    for pattern in js_redirect_patterns:
+        if re.search(pattern, html):
+            return True
+
+    # Very short body with a link (common redirect interstitial)
+    text = re.sub(r'<[^>]+>', '', html).strip()
+    if len(text) < 200 and ('redirect' in lower or 'moved' in lower or 'click here' in lower):
+        return True
+
+    return False
+
+
+def _analyze_redirect_html(html: str, from_url: str, to_url: str,
+                           status, headers: dict) -> dict:
+    """
+    Analyze the HTML body of a single redirect page.
+
+    Redirect pages often contain:
+    - Meta refresh tags (with delays)
+    - JavaScript redirects (window.location, router.push)
+    - Cloaked content visible to bots but not users
+    - Tracking pixels and analytics
+    - SEO signals (canonicals, robots meta, hreflang)
+    - Anti-bot challenges (Cloudflare, Akamai interstitials)
+    """
+    result = {
+        "from_url": from_url,
+        "to_url": to_url,
+        "status": status,
+        "has_body": bool(html),
+        "body_length": len(html) if html else 0,
+        "redirect_methods": [],
+        "seo_signals": {},
+        "cloaking_signals": [],
+        "tracking": [],
+        "anti_bot": [],
+        "content_preview": None,
+    }
+
+    if not html:
+        return result
+
+    lower = html.lower()
+
+    # --- 1. Extract all redirect methods found in the page ---
+
+    # Meta refresh
+    meta_refreshes = re.findall(
+        r'<meta\s+http-equiv=["\']?refresh["\']?\s+content=["\']?([^"\'>\n]+)',
+        html, re.IGNORECASE
+    )
+    for mr in meta_refreshes:
+        # Parse delay and URL: "0;url=https://..."
+        parts = mr.split(';', 1)
+        delay = parts[0].strip()
+        target = parts[1].strip() if len(parts) > 1 else ""
+        target = re.sub(r'^url\s*=\s*', '', target, flags=re.IGNORECASE).strip("'\" ")
+        result["redirect_methods"].append({
+            "type": "meta_refresh",
+            "delay_seconds": delay,
+            "target_url": target,
+            "suspicious": float(delay) > 0 if delay.replace('.', '').isdigit() else True,
+        })
+
+    # JavaScript redirects
+    js_patterns = [
+        (r'window\.location\s*=\s*["\']([^"\']+)["\']', "window.location assignment"),
+        (r'window\.location\.href\s*=\s*["\']([^"\']+)["\']', "location.href assignment"),
+        (r'location\.replace\s*\(\s*["\']([^"\']+)["\']', "location.replace()"),
+        (r'location\.assign\s*\(\s*["\']([^"\']+)["\']', "location.assign()"),
+        (r'document\.location\s*=\s*["\']([^"\']+)["\']', "document.location assignment"),
+        (r'window\.location\.replace\s*\(\s*["\']([^"\']+)["\']', "window.location.replace()"),
+    ]
+    for pattern, method_name in js_patterns:
+        matches = re.findall(pattern, html)
+        for match in matches:
+            result["redirect_methods"].append({
+                "type": "javascript",
+                "method": method_name,
+                "target_url": match,
+            })
+
+    # Framework router redirects
+    router_patterns = [
+        (r'router\.push\s*\(\s*["\']([^"\']+)["\']', "router.push (SPA)"),
+        (r'router\.replace\s*\(\s*["\']([^"\']+)["\']', "router.replace (SPA)"),
+        (r'navigate\s*\(\s*["\']([^"\']+)["\']', "navigate() (React Router/Remix)"),
+        (r'redirect\s*\(\s*["\']([^"\']+)["\']', "redirect() (framework)"),
+    ]
+    for pattern, method_name in router_patterns:
+        matches = re.findall(pattern, html)
+        for match in matches:
+            result["redirect_methods"].append({
+                "type": "framework_router",
+                "method": method_name,
+                "target_url": match,
+            })
+
+    # --- 2. SEO signals in the redirect page ---
+    # Canonical
+    canonical = re.search(
+        r'<link\s+rel=["\']canonical["\'][^>]*href=["\']([^"\']+)["\']', html, re.IGNORECASE
+    )
+    if not canonical:
+        canonical = re.search(
+            r'<link\s+href=["\']([^"\']+)["\'][^>]*rel=["\']canonical["\']', html, re.IGNORECASE
+        )
+    if canonical:
+        result["seo_signals"]["canonical"] = canonical.group(1)
+
+    # Meta robots
+    robots = re.search(
+        r'<meta\s+name=["\']robots["\'][^>]*content=["\']([^"\']+)["\']', html, re.IGNORECASE
+    )
+    if robots:
+        result["seo_signals"]["meta_robots"] = robots.group(1)
+
+    # Title
+    title = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
+    if title:
+        result["seo_signals"]["title"] = title.group(1).strip()[:200]
+
+    # Hreflang
+    hreflangs = re.findall(
+        r'<link\s+rel=["\']alternate["\'][^>]*hreflang=["\']([^"\']+)["\'][^>]*href=["\']([^"\']+)["\']',
+        html, re.IGNORECASE
+    )
+    if hreflangs:
+        result["seo_signals"]["hreflang"] = [
+            {"lang": lang, "href": href} for lang, href in hreflangs
+        ]
+
+    # X-Robots-Tag in response headers
+    x_robots = headers.get("x-robots-tag")
+    if x_robots:
+        result["seo_signals"]["x_robots_tag"] = x_robots
+
+    # --- 3. Cloaking detection ---
+    # Check if the redirect page has substantial content (cloaking: showing
+    # different content to bots vs users during a redirect)
+    text_content = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL | re.IGNORECASE)
+    text_content = re.sub(r'<style[^>]*>.*?</style>', '', text_content, flags=re.DOTALL | re.IGNORECASE)
+    text_content = re.sub(r'<[^>]+>', '', text_content)
+    visible_text = ' '.join(text_content.split()).strip()
+
+    if len(visible_text) > 500:
+        result["cloaking_signals"].append({
+            "type": "content_in_redirect",
+            "detail": f"Redirect page contains {len(visible_text)} chars of visible text "
+                      f"(potential cloaking — bots see this content, users get redirected)",
+            "text_preview": visible_text[:500],
+        })
+
+    # Hidden content (display:none, visibility:hidden) with text
+    hidden_blocks = re.findall(
+        r'<[^>]+style=["\'][^"\']*(?:display\s*:\s*none|visibility\s*:\s*hidden)[^"\']*["\'][^>]*>'
+        r'(.*?)</[^>]+>',
+        html, re.DOTALL | re.IGNORECASE
+    )
+    for block in hidden_blocks:
+        block_text = re.sub(r'<[^>]+>', '', block).strip()
+        if len(block_text) > 50:
+            result["cloaking_signals"].append({
+                "type": "hidden_text",
+                "detail": "Hidden content in redirect page (display:none/visibility:hidden)",
+                "text_preview": block_text[:300],
+            })
+
+    # Noscript content (visible to bots that don't run JS)
+    noscript = re.findall(r'<noscript[^>]*>(.*?)</noscript>', html, re.DOTALL | re.IGNORECASE)
+    for ns in noscript:
+        ns_text = re.sub(r'<[^>]+>', '', ns).strip()
+        if len(ns_text) > 50:
+            result["cloaking_signals"].append({
+                "type": "noscript_content",
+                "detail": "Noscript content in redirect page (visible to non-JS crawlers)",
+                "text_preview": ns_text[:300],
+            })
+
+    # --- 4. Tracking & analytics ---
+    tracking_patterns = [
+        (r'(google-analytics\.com|googletagmanager\.com|ga\.js|gtag|analytics\.js)',
+         "Google Analytics/GTM"),
+        (r'(facebook\.net/|fbevents\.js|fbq\s*\()', "Facebook Pixel"),
+        (r'(mc\.yandex\.ru|metrika)', "Yandex Metrica"),
+        (r'<img[^>]+src=["\'][^"\']*(?:pixel|beacon|track|1x1|\.gif\?)[^"\']*["\']',
+         "Tracking pixel"),
+        (r'(segment\.com|segment\.io|analytics\.min\.js)', "Segment"),
+        (r'(hotjar\.com|hj\s*\()', "Hotjar"),
+    ]
+    seen_tracking = set()
+    for pattern, name in tracking_patterns:
+        if re.search(pattern, html, re.IGNORECASE) and name not in seen_tracking:
+            seen_tracking.add(name)
+            result["tracking"].append(name)
+
+    # --- 5. Anti-bot / challenge detection ---
+    antibot_patterns = [
+        (r'cf-browser-verification|cf-challenge|cf_chl_opt',
+         "Cloudflare challenge page"),
+        (r'akamai.*bot.*manager|_abck\s*=', "Akamai Bot Manager"),
+        (r'captcha|recaptcha|hcaptcha|g-recaptcha',
+         "CAPTCHA challenge"),
+        (r'datadome|dd\.js', "DataDome bot detection"),
+        (r'perimeterx|_pxhd|_px[A-Z]', "PerimeterX/HUMAN"),
+        (r'imperva|incapsula|_incap_', "Imperva/Incapsula"),
+        (r'distil|distil\.js', "Distil Networks"),
+        (r'(blocked|forbidden|access.denied|not.allowed)',
+         "Access denied message"),
+        (r'(please.enable.javascript|javascript.is.required)',
+         "JavaScript required message"),
+    ]
+    for pattern, name in antibot_patterns:
+        if re.search(pattern, lower):
+            result["anti_bot"].append(name)
+
+    # --- 6. Content preview ---
+    result["content_preview"] = visible_text[:1000] if visible_text else None
+
+    return result
+
+
+def _analyze_redirect_chain(redirect_chain: list) -> dict:
+    """
+    Analyze HTML content of all pages in a redirect chain.
+
+    Returns a summary of the full chain plus per-page analysis.
+    """
+    result = {
+        "chain_length": len(redirect_chain),
+        "pages": [],
+        "chain_summary": {
+            "has_meta_refresh": False,
+            "has_js_redirect": False,
+            "has_soft_redirect": False,
+            "has_cloaking": False,
+            "has_anti_bot": False,
+            "has_tracking_on_redirect": False,
+            "total_redirect_methods": 0,
+            "frameworks_detected": [],
+        },
+    }
+
+    if not redirect_chain:
+        return result
+
+    for hop in redirect_chain:
+        body = hop.get("body")
+        analysis = _analyze_redirect_html(
+            html=body,
+            from_url=hop.get("from_url", ""),
+            to_url=hop.get("to_url", ""),
+            status=hop.get("status"),
+            headers=hop.get("headers", {}),
+        )
+        result["pages"].append(analysis)
+
+        # Update chain summary
+        for method in analysis["redirect_methods"]:
+            result["chain_summary"]["total_redirect_methods"] += 1
+            if method["type"] == "meta_refresh":
+                result["chain_summary"]["has_meta_refresh"] = True
+            elif method["type"] == "javascript":
+                result["chain_summary"]["has_js_redirect"] = True
+            elif method["type"] == "framework_router":
+                result["chain_summary"]["has_js_redirect"] = True
+                fw = method.get("method", "")
+                if fw and fw not in result["chain_summary"]["frameworks_detected"]:
+                    result["chain_summary"]["frameworks_detected"].append(fw)
+
+        if hop.get("status") == "soft-redirect":
+            result["chain_summary"]["has_soft_redirect"] = True
+        if analysis["cloaking_signals"]:
+            result["chain_summary"]["has_cloaking"] = True
+        if analysis["anti_bot"]:
+            result["chain_summary"]["has_anti_bot"] = True
+        if analysis["tracking"]:
+            result["chain_summary"]["has_tracking_on_redirect"] = True
+
+    # Strip raw body from redirect_chain to keep trace size manageable
+    # (the analysis already contains content_preview)
+    for hop in redirect_chain:
+        hop.pop("body", None)
+
+    return result
 
 
 def _detect_react_suspense(initial_html: str, rendered_html: str, page) -> dict:
